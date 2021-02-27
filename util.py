@@ -9,6 +9,7 @@ import queue
 import re
 import shutil
 import string
+import random
 import torch
 import torch.nn.functional as F
 import torch.utils.data as data
@@ -402,7 +403,7 @@ def visualize(tbx, pred_dict, eval_path, step, split, num_visuals):
     if num_visuals > len(pred_dict):
         num_visuals = len(pred_dict)
 
-    visual_ids = np.random.choice(list(pred_dict), size=num_visuals, replace=False)
+    visual_ids = random.sample(list(pred_dict), num_visuals)
 
     with open(eval_path, 'r') as eval_file:
         eval_dict = json.load(eval_file)

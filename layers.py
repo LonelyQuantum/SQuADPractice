@@ -93,13 +93,16 @@ class RNNEncoder(nn.Module):
                            dropout=drop_prob if num_layers > 1 else 0.)
 
     def forward(self, x, lengths):
+        # Flatten parameters
+        self.rnn.flatten_parameters()
+
         # Save original padded length for use by pad_packed_sequence
         orig_len = x.size(1)
 
         # Sort by length and pack sequence for RNN
         lengths, sort_idx = lengths.sort(0, descending=True)
         x = x[sort_idx]     # (batch_size, seq_len, input_size)
-        x = pack_padded_sequence(x, lengths, batch_first=True)
+        x = pack_padded_sequence(x, lengths.cpu(), batch_first=True).cuda()
 
         # Apply RNN
         x, _ = self.rnn(x)  # (batch_size, seq_len, 2 * hidden_size)

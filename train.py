@@ -18,7 +18,7 @@ from args import get_train_args
 from collections import OrderedDict
 from json import dumps
 from models import BiDAF
-from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from ujson import load as json_load
 from util import collate_fn, SQuAD
@@ -36,7 +36,6 @@ def main(args):
     # Set random seed
     log.info(f'Using random seed {args.seed}...')
     random.seed(args.seed)
-    np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
@@ -112,7 +111,7 @@ def main(args):
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
-                scheduler.step(step // batch_size)
+                scheduler.step()
                 ema(model, step // batch_size)
 
                 # Log info
