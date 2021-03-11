@@ -17,14 +17,18 @@ import util
 from args import get_train_args
 from collections import OrderedDict
 from json import dumps
-from models import BiDAF
+from models import *
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from ujson import load as json_load
 from util import collate_fn, SQuAD
 
+import faulthandler
+
 
 def main(args):
+    # Set up faulthandler
+    faulthandler.enable()
     # Set up logging and devices
     args.save_dir = util.get_save_dir(args.save_dir, args.name, training=True)
     log = util.get_logger(args.save_dir, args.name)
@@ -42,13 +46,14 @@ def main(args):
     # Get embeddings
     log.info('Loading embeddings...')
     word_vectors = util.torch_from_json(args.word_emb_file)
+    char_vectors = util.torch_from_json(args.char_emb_file)
 
     # Get model
     log.info('Building model...')
-    model = BiDAF(word_vectors=word_vectors,
-                  hidden_size=args.hidden_size,
-                  drop_prob=args.drop_prob)
-    model = nn.DataParallel(model, args.gpu_ids)
+    model_params = {'word_vectors':word_vectors, 'char_vectors':char_vectors, 'args':args}
+    model = get_model(args.model, model_params)
+    print('Model size: {:f} MB'.format(sum(p.nelement()*p.element_size() for p in model.parameters())/(1024*1024)))
+    # model = nn.DataParallel(model, args.gpu_ids)
     if args.load_path:
         log.info(f'Loading checkpoint from {args.load_path}...')
         model, step = util.load_model(model, args.load_path, args.gpu_ids)
@@ -95,24 +100,43 @@ def main(args):
         with torch.enable_grad(), \
                 tqdm(total=len(train_loader.dataset)) as progress_bar:
             for cw_idxs, cc_idxs, qw_idxs, qc_idxs, y1, y2, ids in train_loader:
+                progress_bar.set_description('Batch data_loading finished'.ljust(30))
+                progress_bar.refresh()
+
                 # Setup for forward
                 cw_idxs = cw_idxs.to(device)
                 qw_idxs = qw_idxs.to(device)
+                cc_idxs = cc_idxs.to(device)
+                qc_idxs = qc_idxs.to(device)
                 batch_size = cw_idxs.size(0)
                 optimizer.zero_grad()
+                progress_bar.set_description('Batch initialization finished'.ljust(30))
+                progress_bar.refresh()
 
                 # Forward
-                log_p1, log_p2 = model(cw_idxs, qw_idxs)
+                faulthandler.dump_traceback_later(timeout=3)
+                log_p1, log_p2 = model(cw_idxs, cc_idxs, qw_idxs, qc_idxs)
+                faulthandler.cancel_dump_traceback_later()
+                progress_bar.set_description('Batch forward finished'.ljust(30))
+                progress_bar.refresh()
                 y1, y2 = y1.to(device), y2.to(device)
                 loss = F.nll_loss(log_p1, y1) + F.nll_loss(log_p2, y2)
                 loss_val = loss.item()
+                
 
                 # Backward
+                faulthandler.dump_traceback_later(timeout=3)
                 loss.backward()
+                faulthandler.cancel_dump_traceback_later()
+                progress_bar.set_description('Batch backward finished'.ljust(30))
+                progress_bar.refresh()
                 nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
+                progress_bar.set_description('Optimization finished'.ljust(30))
+                progress_bar.refresh()
                 scheduler.step()
                 ema(model, step // batch_size)
+
 
                 # Log info
                 step += batch_size
@@ -135,6 +159,8 @@ def main(args):
                                                   args.dev_eval_file,
                                                   args.max_ans_len,
                                                   args.use_squad_v2)
+                    progress_bar.set_description('Evaluation finished'.ljust(30))
+                    progress_bar.refresh()
                     saver.save(step, model, results[args.metric_name], device)
                     ema.resume(model)
 
@@ -167,10 +193,12 @@ def evaluate(model, data_loader, device, eval_file, max_len, use_squad_v2):
             # Setup for forward
             cw_idxs = cw_idxs.to(device)
             qw_idxs = qw_idxs.to(device)
+            cc_idxs = cc_idxs.to(device)
+            qc_idxs = qc_idxs.to(device)
             batch_size = cw_idxs.size(0)
 
             # Forward
-            log_p1, log_p2 = model(cw_idxs, qw_idxs)
+            log_p1, log_p2 = model(cw_idxs, cc_idxs, qw_idxs, qc_idxs)
             y1, y2 = y1.to(device), y2.to(device)
             loss = F.nll_loss(log_p1, y1) + F.nll_loss(log_p2, y2)
             nll_meter.update(loss.item(), batch_size)
@@ -201,6 +229,17 @@ def evaluate(model, data_loader, device, eval_file, max_len, use_squad_v2):
     results = OrderedDict(results_list)
 
     return results, pred_dict
+
+def get_model(model_name, model_params):
+    if model_name == 'BiDAF_W':
+        args = model_params['args']
+        return BiDAF_W(model_params['word_vectors'], args.hidden_size, args.drop_prob)
+    elif  model_name == 'BiDAF_CW':
+        args = model_params['args']
+        return BiDAF_CW(model_params['word_vectors'], model_params['char_vectors'], args.char_cnn_o_size, args.hidden_size, args.drop_prob)
+    elif model_name == 'Coattention_W':
+        args = model_params['args']
+        return DCN_W(model_params['word_vectors'], args.hidden_size, args.drop_prob)
 
 
 if __name__ == '__main__':

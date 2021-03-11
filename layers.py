@@ -11,8 +11,9 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from util import masked_softmax
 
+import sys
 
-class Embedding(nn.Module):
+class Embedding_CW(nn.Module):
     """Embedding layer used by BiDAF, without the character-level component.
 
     Word-level embeddings are further refined using a 2-layer Highway Encoder
@@ -20,24 +21,61 @@ class Embedding(nn.Module):
 
     Args:
         word_vectors (torch.Tensor): Pre-trained word vectors.
+        char_vectors (torch.Tensor): Pre-trained character vectors.
+        hidden_size (int): Size of hidden activations.
+        drop_prob (float): Probability of zero-ing out activations
+    """
+    def __init__(self, word_vectors, char_vectors, char_cnn_output_size, hidden_size, drop_prob):
+        super(Embedding_CW, self).__init__()
+        self.drop_prob = drop_prob
+        self.char_emb_size = char_vectors.size(1)
+        self.char_cnn_output_size = char_cnn_output_size
+        self.char_cnn_kernel_size = 5
+        self.char_limit = 16
+        self.embed_w = nn.Embedding.from_pretrained(word_vectors)
+        self.embed_c = nn.Embedding.from_pretrained(char_vectors)
+        self.cnn_c = nn.Conv1d(self.char_emb_size, self.char_cnn_output_size, self.char_cnn_kernel_size)
+        self.maxpool_c = nn.MaxPool1d(self.char_limit - self.char_cnn_kernel_size + 1)
+        self.proj = nn.Linear(word_vectors.size(1)+self.char_cnn_output_size, hidden_size, bias=False)
+        self.hwy = HighwayEncoder(2, hidden_size)
+
+    def forward(self, w_idxs, c_idxs):
+        emb_w = self.embed_w(w_idxs)   # (batch_size, seq_len, embed_size)
+        emb_c = self.embed_c(c_idxs)   # (batch_size, seq_len, word_len, embed_size)
+        emb_c = emb_c.view([-1,emb_c.size(2),emb_c.size(3)]).permute([0,2,1])
+        emb_c = self.cnn_c(emb_c)
+        emb_c = self.maxpool_c(emb_c).squeeze().view([emb_w.size(0),emb_w.size(1),self.char_cnn_output_size])
+        emb = torch.cat([emb_w,emb_c],dim=2)
+        emb = F.dropout(emb, self.drop_prob, self.training)
+        emb = self.proj(emb)  # (batch_size, seq_len, hidden_size)
+        emb = self.hwy(emb)   # (batch_size, seq_len, hidden_size)
+        return emb
+
+class Embedding_W(nn.Module):
+    """Embedding layer used by BiDAF, without the character-level component.
+
+    Word-level embeddings are further refined using a 2-layer Highway Encoder
+    (see `HighwayEncoder` class for details).
+
+    Args:
+        word_vectors (torch.Tensor): Pre-trained word vectors.
+        char_vectors (torch.Tensor): Pre-trained character vectors.
         hidden_size (int): Size of hidden activations.
         drop_prob (float): Probability of zero-ing out activations
     """
     def __init__(self, word_vectors, hidden_size, drop_prob):
-        super(Embedding, self).__init__()
+        super(Embedding_W, self).__init__()
         self.drop_prob = drop_prob
-        self.embed = nn.Embedding.from_pretrained(word_vectors)
+        self.embed_w = nn.Embedding.from_pretrained(word_vectors)
         self.proj = nn.Linear(word_vectors.size(1), hidden_size, bias=False)
         self.hwy = HighwayEncoder(2, hidden_size)
 
-    def forward(self, x):
-        emb = self.embed(x)   # (batch_size, seq_len, embed_size)
+    def forward(self, w_idxs):
+        emb = self.embed_w(w_idxs)   # (batch_size, seq_len, embed_size)    
         emb = F.dropout(emb, self.drop_prob, self.training)
         emb = self.proj(emb)  # (batch_size, seq_len, hidden_size)
         emb = self.hwy(emb)   # (batch_size, seq_len, hidden_size)
-
         return emb
-
 
 class HighwayEncoder(nn.Module):
     """Encode an input sequence using a highway network.
@@ -184,6 +222,61 @@ class BiDAFAttention(nn.Module):
         s = s0 + s1 + s2 + self.bias
 
         return s
+
+class CoAttention(nn.Module):
+    """Coattention originally used by DCN.
+
+    Coattention layer adds a second level attention of the first level C2Q and Q2C 
+    attentions. The output would be the BiLSTM hidden states of the concatenation 
+    of the first level C2Q attention and the second level attention.
+
+    Args:
+        hidden_size (int): Size of hidden activations.
+        drop_prob (float): Probability of zero-ing out activations.
+    """
+    def __init__(self, hidden_size, drop_prob=0.1):
+        super(CoAttention, self).__init__()
+        self.drop_prob = drop_prob
+        self.hidden_size = hidden_size
+        self.proj = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.c_cent = nn.Parameter(torch.zeros(1, hidden_size))
+        self.q_cent = nn.Parameter(torch.zeros(1, hidden_size))
+        self.rnn = RNNEncoder(input_size=hidden_size*2,
+                              hidden_size=hidden_size*2, 
+                              num_layers=1, 
+                              drop_prob=drop_prob)
+        if torch.cuda.is_available():
+            self.device = 'cuda:0'
+        else:
+            self.device = 'cpu'
+        for weight in (self.c_cent, self.q_cent):
+            nn.init.xavier_uniform_(weight)
+
+    def forward(self, c, q, c_mask, q_mask):
+        batch_size, c_len, _ = c.size()
+        q_len = q.size(1)
+        # Get the projected q
+        q = self.proj(q)
+        q = F.dropout(q, self.drop_prob, self.training)
+        q = F.relu(q) # (batch_size, q_len, hidden_size)
+        # Add sentinel vectors
+        q = torch.cat([q,self.q_cent.unsqueeze(0).repeat(batch_size,1,1)], dim=1) # (batch_size, q_len+1, hidden_size)
+        c = torch.cat([c,self.c_cent.unsqueeze(0).repeat(batch_size,1,1)], dim=1) # (batch_size, c_len+1, hidden_size)
+        q_mask = torch.cat([q_mask, torch.ones(batch_size, 1).to(self.device)], dim=1) # (batch_size, q_len+1)
+        c_mask = torch.cat([c_mask, torch.ones(batch_size, 1).to(self.device)], dim=1) # (batch_size, c_len+1)
+        # Compute affinity matrix
+        L = torch.bmm(c, q.transpose(1,2)) # (bs, c_len+1, hid_size) x (bs, hid_size, q_len+1) => (bs, c_len+1, q_len+1)
+        # Compute C2Q attention
+        alpha = masked_softmax(L, q_mask.view(batch_size, 1, q_len+1), dim=2)  # (batch_size, c_len+1, q_len+1)
+        c2q_att = torch.bmm(alpha, q)  # (bs, c_len+1, q_len+1) x (bs, q_len+1, hid_size) => (bs, c_len+1, hid_size)
+        # Compute Q2C attention
+        beta = masked_softmax(L, c_mask.view(batch_size, c_len+1, 1), dim=1) # (batch_size, c_len+1, q_len+1)
+        q2c_att = torch.bmm(beta.transpose(1,2), c) # (bs, q_len+1, c_len+1) x (bs, c_len+1, hid_size) => (bs, q_len+1, hid_size)
+        # Compute second level attention
+        att_lv2 = torch.bmm(alpha, q2c_att)  # (bs, c_len+1, q_len+1) x (bs, q_len+1, hid_size) => (bs, c_len+1, hid_size)
+        x = torch.cat([att_lv2, c2q_att], dim=2) # (batch_size, c_len+1, hidden_size*2)
+        x = self.rnn(x[:,:c_len,:], c_mask[:,:c_len].sum(-1)) # (batch_size, c_len, hidden_size*4)
+        return x
 
 
 class BiDAFOutput(nn.Module):

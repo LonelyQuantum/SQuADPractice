@@ -204,6 +204,11 @@ def add_common_args(parser):
 
 def add_train_test_args(parser):
     """Add arguments common to train.py and test.py"""
+    parser.add_argument('--model',
+                        '-m',
+                        type=str,
+                        default='BiDAF_W',
+                        help='Name to identify training or test run.')
     parser.add_argument('--name',
                         '-n',
                         type=str,
@@ -215,7 +220,7 @@ def add_train_test_args(parser):
                         help='Maximum length of a predicted answer.')
     parser.add_argument('--num_workers',
                         type=int,
-                        default=4,
+                        default=2,
                         help='Number of sub-processes to use per data loader.')
     parser.add_argument('--save_dir',
                         type=str,
@@ -223,20 +228,24 @@ def add_train_test_args(parser):
                         help='Base directory for saving information.')
     parser.add_argument('--batch_size',
                         type=int,
-                        default=128,
+                        default=16,
                         help='Batch size per GPU. Scales automatically when \
                               multiple GPUs are available.')
     parser.add_argument('--use_squad_v2',
                         type=lambda s: s.lower().startswith('t'),
                         default=True,
                         help='Whether to use SQuAD 2.0 (unanswerable) questions.')
+    parser.add_argument('--char_cnn_o_size',
+                        type=int,
+                        default=0,
+                        help='Number of output channels of CharCNN.')
     parser.add_argument('--hidden_size',
                         type=int,
                         default=100,
                         help='Number of features in encoder hidden layers.')
     parser.add_argument('--num_visuals',
                         type=int,
-                        default=30,
+                        default=10,
                         help='Number of examples to visualize in TensorBoard.')
     parser.add_argument('--load_path',
                         type=str,
